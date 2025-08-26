@@ -1,0 +1,23 @@
+# Web framework
+fastapi==0.104.1
+
+# ASGI server
+uvicorn[standard]==0.24.0
+
+# Async MongoDB driver
+motor==3.3.2
+
+# Pydantic for data validation
+pydantic==2.5.0
+
+# File uploads
+python-multipart==0.0.6
+
+# Precompiled numpy for Windows
+numpy==1.24.4
+
+# Precompiled OpenCV headless for Windows
+opencv-python-headless==4.8.1.78
+
+# For environment variable management
+python-dotenv==1.1.1
