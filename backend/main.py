@@ -26,7 +26,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+# ADD HTTPS REDIRECT MIDDLEWARE FOR RENDER.COM
+if os.environ.get('RENDER'):
+    app.add_middleware(HTTPSRedirectMiddleware)
+    
 # Serve uploaded files
 os.makedirs("static/images", exist_ok=True)
 os.makedirs("static/videos", exist_ok=True)
@@ -210,7 +213,7 @@ async def delete_ad(ad_id: str):
         raise HTTPException(status_code=400, detail="Invalid ad ID")
 
 # WebSocket endpoint for real-time detection
-@app.websocket("/ws/detect")
+# @app.websocket("/ws/detect")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_connections.append(websocket)
@@ -376,7 +379,183 @@ async def websocket_endpoint(websocket: WebSocket):
         if connection_id in detection_states:
             del detection_states[connection_id]
         active_connections.remove(websocket)
-
+# WebSocket endpoint for real-time detection with better error handling
+@app.websocket("/ws/detect")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    
+    # Initialize detection state for this connection
+    connection_id = id(websocket)
+    detection_states[connection_id] = {
+        "active_ad": None,
+        "active_since": None,
+        "last_position": None,
+        "detection_threshold": 3,
+    }
+    
+    # Initialize BFMatcher for faster performance
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    
+    try:
+        while True:
+            try:
+                # Add timeout to prevent hanging
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await websocket.send_text(json.dumps({"type": "ping", "message": "keepalive"}))
+                continue
+            
+            # Decode base64 to image
+            try:
+                image_data = base64.b64decode(data)
+                image = Image.open(io.BytesIO(image_data))
+                frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"Error decoding image: {e}")
+                continue
+            
+            # Preprocess frame for better feature detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)  # Light blur for noise reduction
+            
+            # Detect ads
+            detected_ads = []
+            
+            # Initialize ORB for frame
+            orb = cv2.ORB_create(800)  # Reduced features for faster detection
+            kp_frame, des_frame = orb.detectAndCompute(gray, None)
+            
+            current_state = detection_states[connection_id]
+            
+            # If we have an active ad that was recently detected, check if it's still visible first
+            if (current_state["active_ad"] and 
+                current_state["active_since"] and 
+                time.time() - current_state["active_since"] < 5):  # Active for 5 seconds max
+                
+                ad_id = current_state["active_ad"]
+                detector = orb_detectors.get(ad_id)
+                
+                if detector and detector["des"] is not None and des_frame is not None:
+                    # Quick check for the active ad
+                    matches = bf.match(detector["des"], des_frame)
+                    matches = sorted(matches, key=lambda x: x.distance)
+                    
+                    # If we still have a good match, use the last known position
+                    if len(matches) > 10 and matches[0].distance < 50:
+                        detected_ads.append({
+                            "id": ad_id,
+                            "videoUrl": detector["video_url"],
+                            "name": detector["name"],
+                            "status": "active"
+                        })
+                        await websocket.send_text(json.dumps(detected_ads))
+                        continue
+            
+            # If no active ad or active ad not found, check all ads
+            if des_frame is not None and len(kp_frame) > 15:
+                best_match = None
+                best_match_score = 0
+                
+                for ad_id, detector in orb_detectors.items():
+                    if detector["des"] is not None and len(detector["kp"]) > 8:
+                        try:
+                            # Use BFMatcher for speed
+                            matches = bf.match(detector["des"], des_frame)
+                            matches = sorted(matches, key=lambda x: x.distance)
+                            
+                            # Simple threshold based on good matches
+                            good_matches = [m for m in matches if m.distance < 50]
+                            
+                            if len(good_matches) > 12:
+                                # Calculate match quality score
+                                match_score = len(good_matches) / len(detector["kp"]) if len(detector["kp"]) > 0 else 0
+                                
+                                if match_score > best_match_score:
+                                    best_match_score = match_score
+                                    best_match = (ad_id, detector, good_matches, kp_frame)
+                                    
+                        except Exception as e:
+                            print(f"Error matching features for ad {ad_id}: {e}")
+                            continue
+                
+                # Process the best match
+                if best_match and best_match_score > 0.15:
+                    ad_id, detector, good_matches, kp_frame = best_match
+                    
+                    src_pts = np.float32([detector["kp"][m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    
+                    try:
+                        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                        
+                        if H is not None:
+                            h, w = detector["shape"]
+                            pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+                            dst = cv2.perspectiveTransform(pts, H)
+                            
+                            # Calculate bounding box
+                            x_coords = [point[0][0] for point in dst]
+                            y_coords = [point[0][1] for point in dst]
+                            
+                            x_min, x_max = min(x_coords), max(x_coords)
+                            y_min, y_max = min(y_coords), max(y_coords)
+                            
+                            # Normalize coordinates to percentage of frame size
+                            frame_height, frame_width = frame.shape[:2]
+                            
+                            # Update detection state
+                            current_state["active_ad"] = ad_id
+                            current_state["active_since"] = time.time()
+                            current_state["last_position"] = {
+                                "x": float((x_min / frame_width) * 100),
+                                "y": float((y_min / frame_height) * 100),
+                                "width": float(((x_max - x_min) / frame_width) * 100),
+                                "height": float(((y_max - y_min) / frame_height) * 100),
+                            }
+                            
+                            detected_ads.append({
+                                "id": ad_id,
+                                "x": float((x_min / frame_width) * 100),
+                                "y": float((y_min / frame_height) * 100),
+                                "width": float(((x_max - x_min) / frame_width) * 100),
+                                "height": float(((y_max - y_min) / frame_height) * 100),
+                                "videoUrl": detector["video_url"],
+                                "name": detector["name"],
+                                "score": float(best_match_score),
+                                "status": "new"
+                            })
+                    except Exception as e:
+                        print(f"Error calculating homography: {e}")
+            
+            # If no ads detected but we have an active ad, continue tracking it
+            elif current_state["active_ad"] and current_state["last_position"]:
+                ad_id = current_state["active_ad"]
+                detector = orb_detectors.get(ad_id)
+                
+                if detector:
+                    detected_ads.append({
+                        "id": ad_id,
+                        **current_state["last_position"],
+                        "videoUrl": detector["video_url"],
+                        "name": detector["name"],
+                        "status": "tracking"
+                    })
+            
+            # Send detected ads back to client
+            await websocket.send_text(json.dumps(detected_ads))
+            
+    except WebSocketDisconnect:
+        print(f"WebSocket disconnected: {connection_id}")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        # Cleanup
+        if connection_id in detection_states:
+            del detection_states[connection_id]
+        if websocket in active_connections:
+            active_connections.remove(websocket)
 @app.get("/")
 def root():
     return {"message": "Add-to-Video backend running"}
